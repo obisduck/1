@@ -1,0 +1,558 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import sys
+import os
+import threading
+import webbrowser
+import requests
+import datetime
+import base64
+import ssl
+import secrets
+from flask import Flask, request
+from werkzeug.serving import make_server
+from openpyxl import load_workbook
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.backends import default_backend
+
+import certifi
+
+def get_market_orders(self, type_id):
+    print(f"当前证书路径：{certifi.where()}")  # 检查证书路径
+    response = requests.get(url, 
+        params=params, 
+        headers=headers, 
+        verify=certifi.where(),  # 显式指定证书路径
+        timeout=15
+    )
+
+# ================== 配置部分 ==================
+CLIENT_ID = "bcf280435e524abf8e72b216813be22c"
+CLIENT_SECRET = "O5BbNPcT6pggLg4lEnio9bd4BMreletdscHNuYkr"
+CALLBACK_URL = "https://localhost:443/esi_callback"
+REGION_ID = 10000002  # The Forge星域
+
+# ================== 数据加载 ==================
+def get_base_path():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    else:
+        return os.path.dirname(os.path.abspath(__file__))
+
+base_path = get_base_path()
+file_path = os.path.join(base_path, "eve_industry.xlsx")
+sheet_name = "Sheet1"
+
+wb = load_workbook(filename=file_path, read_only=True)
+ws = wb[sheet_name]
+
+matrix = []
+for row in ws.iter_rows(min_row=2, values_only=True):
+    matrix.append([cell if cell is not None else "" for cell in row])
+
+def find_blueprint_id(target_name):
+    for row in matrix:
+        if row[7] == target_name:
+            return row[0]
+    return None
+
+def find_product_id(target_name):
+    for row in matrix:
+        if row[7] == target_name:
+            return row[6]
+    return None
+
+def get_materials(bp_id):
+    materials = []
+    for row in matrix:
+        if row[0] == bp_id:
+            material = {
+                'id': row[2],
+                'name_zh': row[3],
+                'name_en': row[4],
+                'quantity': row[5],
+                'output_quantity': row[7] or 1  # 第8列为产出数量
+            }
+            materials.append(material)
+    return materials
+
+# ================== ESI 管理模块 ==================
+class ESIDataManager:
+    def __init__(self):
+        self.oauth_state = None
+        self.access_token = None
+        self.refresh_token = None
+        self.token_expiry = None
+        self.server = None
+        self.cert_path = os.path.join(base_path, "localhost.pem")
+        self.key_path = os.path.join(base_path, "localhost.key")
+        self._generate_ssl_cert()
+        self.auth_header = base64.b64encode(f"{CLIENT_ID}:{CLIENT_SECRET}".encode()).decode()
+
+    def start_auth_flow(self):                                                                       
+        """启动OAuth认证流程"""
+        # 生成随机state参数（至少16字符）
+        self.oauth_state = secrets.token_urlsafe(16)
+        
+        auth_url = (
+            f"https://login.eveonline.com/v2/oauth/authorize/"
+            f"?response_type=code&client_id={CLIENT_ID}"
+            f"&redirect_uri={CALLBACK_URL}&scope=esi-markets.structure_markets.v1"
+            f"&state={self.oauth_state}"  # 新增state参数
+        )
+        webbrowser.open(auth_url)
+        self.start_server()
+
+
+    def _generate_ssl_cert(self):
+        """生成自签名证书"""
+        if not os.path.exists(self.cert_path):
+            key = rsa.generate_private_key(
+                public_exponent=65537,
+                key_size=2048,
+                backend=default_backend()
+            )
+            
+            subject = issuer = x509.Name([
+                x509.NameAttribute(NameOID.COMMON_NAME, "localhost"),
+            ])
+            cert = x509.CertificateBuilder().subject_name(
+                subject
+            ).issuer_name(
+                issuer
+            ).public_key(
+                key.public_key()
+            ).serial_number(
+                x509.random_serial_number()
+            ).not_valid_before(
+                datetime.datetime.utcnow()
+            ).not_valid_after(
+                datetime.datetime.utcnow() + datetime.timedelta(days=365)
+            ).add_extension(
+                x509.SubjectAlternativeName([x509.DNSName("localhost")]),
+                critical=False,
+            ).sign(key, hashes.SHA256(), default_backend())
+
+            with open(self.key_path, "wb") as f:
+                f.write(key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.TraditionalOpenSSL,
+                    encryption_algorithm=serialization.NoEncryption(),
+                ))
+
+            with open(self.cert_path, "wb") as f:
+                f.write(cert.public_bytes(serialization.Encoding.PEM))
+
+
+
+    def start_server(self):
+        """启动临时Web服务器"""
+        app = Flask(__name__)
+        
+        @app.route('/esi_callback')
+        def callback():
+            received_state = request.args.get('state')
+            if received_state != self.oauth_state:
+                self._show_error("安全错误", "State参数验证失败")
+                return "State参数不匹配，可能遭受CSRF攻击", 403
+            
+            code = request.args.get('code')
+            if self.get_initial_token(code):
+                return "认证成功！请返回应用程序"
+            return "认证失败"
+        
+        ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ssl_context.load_cert_chain(self.cert_path, self.key_path)
+        self.server = make_server('localhost', 443, app, ssl_context=ssl_context)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def get_initial_token(self, code):
+        """获取初始访问令牌"""
+        token_url = "https://login.eveonline.com/v2/oauth/token"
+        headers = {
+            "Authorization": f"Basic {self.auth_header}",
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        data = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": CALLBACK_URL
+        }
+        
+        try:
+            response = requests.post(token_url, headers=headers, data=data, verify=False)
+            response.raise_for_status()
+            token_data = response.json()
+            self._update_tokens(token_data)
+            return True
+        except Exception as e:
+            self._show_error("Token获取失败", str(e))
+            return False
+
+    def refresh_access_token(self):
+        """刷新访问令牌"""
+        token_url = "https://login.eveonline.com/v2/oauth/token"
+        headers = {
+            "Authorization": f"Basic {self.auth_header}",
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        data = {
+            "grant_type": "refresh_token",
+            "refresh_token": self.refresh_token
+        }
+        
+        try:
+            response = requests.post(token_url, headers=headers, data=data, verify=False)
+            response.raise_for_status()
+            token_data = response.json()
+            self._update_tokens(token_data)
+            return True
+        except Exception as e:
+            self._show_error("Token刷新失败", str(e))
+            return False
+
+    def _update_tokens(self, token_data):
+        """更新令牌信息"""
+        self.access_token = token_data['access_token']
+        self.refresh_token = token_data['refresh_token']
+        self.token_expiry = datetime.datetime.now() + datetime.timedelta(seconds=token_data['expires_in'])
+        self._schedule_refresh(token_data['expires_in'] - 300)
+
+    def _schedule_refresh(self, delay):
+        """安排定时刷新"""
+        if delay > 0:
+            threading.Timer(delay, self.refresh_access_token).start()
+
+    def get_market_price(self, type_id):
+        """获取市场最低价"""
+        orders = self.get_market_orders(type_id)
+        sell_orders = [o for o in orders if not o['is_buy_order']]
+        return {
+            'sell_min': min(o['price'] for o in sell_orders) if sell_orders else 0,
+            'buy_max': max(o['price'] for o in sell_orders) if sell_orders else 0
+        }
+
+    def get_market_orders(self, type_id):
+        """获取市场订单"""
+        url = f"https://esi.evetech.net/latest/markets/{REGION_ID}/orders/"
+        params = {"type_id": type_id, "page": 1}
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        orders = []
+        
+        while True:
+            response = requests.get(url, params=params, headers=headers, verify=False)
+            if response.status_code == 401:
+                self.refresh_access_token()
+                headers = {"Authorization": f"Bearer {self.access_token}"}
+                continue
+                
+            response.raise_for_status()
+            data = response.json()
+            orders.extend(data)
+            
+            pages = int(response.headers.get('x-pages', 1))
+            if params['page'] >= pages:
+                break
+            params['page'] += 1
+            
+        return sorted(orders, key=lambda x: x['price'])
+
+    def _show_error(self, title, message):
+        """显示错误信息"""
+        if threading.current_thread() is threading.main_thread():
+            messagebox.showerror(title, message)
+        else:
+            def _show():
+                messagebox.showerror(title, message)
+            tk.Tk().after(0, _show)
+
+# ================== GUI 界面 ==================
+class Application(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("EVE工业计算器 - 集成ESI市场数据")
+        self.geometry("1000x800")
+        
+        # ESI 管理模块
+        self.esi = ESIDataManager()
+        
+        # 界面组件
+        self._create_widgets()
+        self._configure_styles()
+
+    def _create_widgets(self):
+        """创建界面组件"""
+        # 顶部工具栏
+        toolbar = ttk.Frame(self)
+        toolbar.pack(fill=tk.X, padx=5, pady=5)
+        
+        # 搜索框
+        self.entry = ttk.Entry(toolbar, width=40)
+        self.entry.pack(side=tk.LEFT, padx=5)
+        
+        # 搜索按钮
+        self.search_btn = ttk.Button(toolbar, text="搜索蓝图", command=self.on_search)
+        self.search_btn.pack(side=tk.LEFT, padx=5)
+        
+        # ESI登录按钮
+        self.esi_btn = ttk.Button(toolbar, text="登录ESI", command=self.start_auth)
+        self.esi_btn.pack(side=tk.RIGHT, padx=5)
+        
+        # 树状视图
+        self.tree_frame = ttk.Frame(self)
+        self.tree_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        self.tree = ttk.Treeview(
+            self.tree_frame, 
+            columns=('quantity', 'price', 'cost', 'profit'), 
+            show='tree headings',
+            selectmode='extended'
+        )
+        
+        # 配置列
+        self.tree.heading('#0', text='材料名称', anchor=tk.W)
+        self.tree.heading('quantity', text='数量', anchor=tk.W)
+        self.tree.heading('price', text='市场单价', anchor=tk.W)
+        self.tree.heading('cost', text='材料成本', anchor=tk.W)
+        self.tree.heading('profit', text='预期利润', anchor=tk.W)
+        
+        self.tree.column('#0', width=300, stretch=tk.NO)
+        self.tree.column('quantity', width=80, anchor=tk.E)
+        self.tree.column('price', width=120, anchor=tk.E)
+        self.tree.column('cost', width=120, anchor=tk.E)
+        self.tree.column('profit', width=120, anchor=tk.E)
+        
+        # 滚动条
+        vsb = ttk.Scrollbar(self.tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _configure_styles(self):
+        """配置树状图样式"""
+        style = ttk.Style()
+        
+        # 定义标签样式替代状态映射
+        style.configure('positive.Treeview', 
+                    background='#dff0d8', 
+                    foreground='#3c763d')
+        style.configure('negative.Treeview', 
+                    background='#f2dede', 
+                    foreground='#a94442')
+    
+    # 设置默认行高
+        style.configure('Treeview', rowheight=25)
+
+    def start_auth(self):
+        """启动认证流程"""
+        threading.Thread(target=self.esi.start_auth_flow, daemon=True).start()
+
+    def on_search(self):
+        """整合后的搜索与数据显示逻辑"""
+        target_name = self.entry.get().strip()
+        if not target_name:
+            return
+
+        # 清理旧数据
+        self.tree.delete(*self.tree.get_children())
+
+        # 检查ESI认证
+        if not self.esi.access_token:
+            messagebox.showwarning("需要认证", "请先登录ESI获取市场数据")
+            return
+
+        # 获取蓝图数据
+        bp_id = find_blueprint_id(target_name)
+        if not bp_id:
+            messagebox.showerror("错误", f"未找到蓝图: {target_name}")
+            return
+
+        materials = get_materials(bp_id)
+        if not materials:
+            self.tree.insert('', 'end', text=f"{target_name} (基础材料)")
+            return
+
+        # 创建结构节点
+        product_node = self.tree.insert(
+            '', 'end', 
+            text=f"成品：{target_name}",
+            values=("1", "获取中...", "计算中...", "计算中..."),
+            tags=('product', 'toprow')
+        )
+
+        materials_node = self.tree.insert(
+            '', 'end',
+            text=f"材料清单 [{target_name}]",
+            values=("总数量", "平均单价", "总成本", "利润影响"),
+            tags=('material_header',)
+        )
+
+        # 递归添加材料
+        self._add_materials(materials_node, materials, set())
+
+        # 展开节点并计算
+        self.tree.item(product_node, open=True)
+        self.tree.item(materials_node, open=True)
+        self._calculate_product_profit(product_node, target_name)
+
+        # 样式优化
+        self.tree.tag_configure('toprow', background='#f0f8ff', font=('Arial', 10, 'bold'))
+        
+    def _add_materials(self, parent_node, materials, processed, multiplier=1):
+        """递归添加材料"""
+        for mat in materials:
+        # 获取材料基础信息
+            mat_name = mat['name_zh']
+            base_quantity = mat['quantity']
+            
+            # 计算实际数量（考虑父级乘数）
+            actual_quantity = base_quantity * multiplier
+            
+            # 获取市场数据
+            try:
+                price_data = self.esi.get_market_price(mat['id'])
+                price = price_data['sell_min']
+                cost = price * actual_quantity
+            except Exception as e:
+                price = 0
+                cost = 0
+            
+            # 创建节点
+            node = self.tree.insert(
+                parent_node, 'end', 
+                text=mat_name,
+                values=(
+                    f"{actual_quantity:,.1f}",
+                    f"{price:,.2f} ISK" if price else "N/A",
+                    f"{cost:,.2f} ISK" if cost else "N/A",
+                    ""
+                )
+            )
+            
+            # 处理子材料
+            mat_bp_id = find_blueprint_id(mat_name)
+            if mat_bp_id and mat_name not in processed:
+                new_processed = processed.copy()
+                new_processed.add(mat_name)
+                sub_mats = get_materials(mat_bp_id)
+                if sub_mats:
+                    self._add_materials(node, sub_mats, new_processed, actual_quantity)
+
+    def _calculate_profit(self):
+        """计算利润并更新显示"""
+        for item in self.tree.get_children():
+            self._update_profit(item)
+
+    def _update_profit(self, item):
+            #包含成品价格获取的完整计算
+        if 'product' in self.tree.item(item, 'tags'):
+            # 处理成品节点
+            product_name = self.tree.item(item, 'text').split('制造 ')[-1]
+            product_id = find_blueprint_id(product_name)
+            
+            if product_id:
+                try:
+                    # 获取成品市场价
+                    price_data = self.esi.get_market_price(product_id)
+                    sell_price = price_data['sell_min']
+                    
+                    # 更新成品数据
+                    output_quantity = float(self.tree.set(item, 'quantity'))
+                    self.tree.set(item, 'price', f"{sell_price:,.2f} ISK")
+                    total_cost = self._parse_isk_value(self.tree.set(item, 'cost'))
+                    profit = (sell_price * output_quantity) - total_cost
+                    
+                    # 更新显示
+                    self.tree.set(item, 'profit', f"{profit:,.2f} ISK")
+                    self.tree.item(item, tags=('product', 'positive' if profit >=0 else 'negative'))
+                except Exception as e:
+                    self.tree.set(item, 'price', "获取失败")
+                    self.esi._show_error("成品数据错误", f"{product_name}: {str(e)}")
+            else:        
+                """递归更新利润数据"""
+                children = self.tree.get_children(item)
+                if children:
+                    total_cost = 0
+                    for child in children:
+                        self._update_profit(child)
+                        cost = self._parse_isk_value(self.tree.set(child, 'cost'))
+                        total_cost += cost
+                    
+                    # 更新父节点成本
+                    self.tree.set(item, 'cost', f"{total_cost:,.2f} ISK")
+                    
+                    # 计算利润（需要产品价格数据）
+                    item_name = self.tree.item(item, 'text')
+                    if '制造' in item_name:
+                        product_name = item_name.split('制造 ')[-1]
+                        product_id = find_blueprint_id(product_name)
+                        if product_id:
+                            try:
+                                price_data = self.esi.get_market_price(product_id)
+                                revenue = price_data['sell_min']
+                                cost = total_cost
+                                profit = revenue - cost
+                                
+                                # 使用标签代替状态映射
+                                profit_tag = 'positive' if profit >=0 else 'negative'
+                                self.tree.set(item, 'profit', f"{profit:,.2f} ISK")
+                                self.tree.item(item, tags=(profit_tag,))
+                            except Exception as e:
+                                self.esi._show_error("市场数据错误", str(e))
+
+    def _parse_isk_value(self, value_str):
+        """解析金额字符串"""
+        if 'ISK' in value_str:
+            return float(value_str.replace(' ISK', '').replace(',', ''))
+        return 0
+
+    def _calculate_product_profit(self, product_node, product_name):
+        """独立计算成品利润"""
+        def sum_nested_costs(node):
+            return sum(
+                self._parse_isk_value(self.tree.set(child, 'cost'))
+                for child in self.tree.get_children(node)
+            )
+        
+        product_id = find_product_id(product_name)
+        if product_id:
+            try:
+                # 获取成品市场价格
+                price_data = self.esi.get_market_price(product_id)
+                sell_price = price_data['sell_min']
+                
+                # 定位材料清单节点（成品节点的下一个同级节点）
+                material_root = self.tree.next(product_node)
+                
+                # 递归计算总成本（从材料清单节点开始）
+                total_cost = sum_nested_costs(material_root)
+                
+                # 更新显示数据（考虑产出数量）
+                self.tree.set(product_node, 'cost', f"{total_cost:,.2f} ISK")
+                profit = sell_price - total_cost
+                self.tree.set(product_node, 'profit', f"{profit:,.2f} ISK")
+                
+                # 设置数值显示格式
+                self.tree.set(product_node, 'price', f"{sell_price:,.2f} ISK")
+                self.tree.set(product_node, 'cost', f"{total_cost:,.2f} ISK")
+                self.tree.set(product_node, 'profit', f"{profit:,.2f} ISK")
+                
+                # 设置颜色标签
+                self.tree.item(product_node,
+                            tags=('product', 'positive' if profit >=0 else 'negative'))
+                
+            except Exception as e:
+                self.esi._show_error("计算错误", 
+                    f"成品：{product_name}\n错误详情：{str(e)}")
+
+
+
+
+if __name__ == "__main__":
+    app = Application()
+    app.mainloop()
+
