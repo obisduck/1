@@ -74,7 +74,21 @@ def get_materials(bp_id):
                 'name_zh': row[3],
                 'name_en': row[4],
                 'quantity': row[5],
-                'output_quantity': row[7] or 1  # 第8列为产出数量
+                'output_quantity': row[9] or None  # 第10列为产出数量
+            }
+            materials.append(material)
+    return materials
+
+def get_output_quantity(product_id):
+    materials = []
+    for row in matrix:
+        if row[6] == product_id:
+            material = {
+                'id': row[2],
+                'name_zh': row[3],
+                'name_en': row[4],
+                'quantity': row[5],
+                'output_quantity': row[9] or None  # 第10列为产出数量
             }
             materials.append(material)
     return materials
@@ -269,7 +283,9 @@ class ESIDataManager:
                 messagebox.showerror(title, message)
             tk.Tk().after(0, _show)
 
-# ================== GUI 界面 ==================
+
+
+
 class Application(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -401,7 +417,7 @@ class Application(tk.Tk):
 
         # 样式优化
         self.tree.tag_configure('toprow', background='#f0f8ff', font=('Arial', 10, 'bold'))
-        
+        pass
     def _add_materials(self, parent_node, materials, processed, multiplier=1):
         """递归添加材料"""
         for mat in materials:
@@ -446,63 +462,79 @@ class Application(tk.Tk):
         """计算利润并更新显示"""
         for item in self.tree.get_children():
             self._update_profit(item)
-
+            
     def _update_profit(self, item):
-            #包含成品价格获取的完整计算
         if 'product' in self.tree.item(item, 'tags'):
             # 处理成品节点
             product_name = self.tree.item(item, 'text').split('制造 ')[-1]
             product_id = find_blueprint_id(product_name)
-            
+
             if product_id:
                 try:
                     # 获取成品市场价
                     price_data = self.esi.get_market_price(product_id)
                     sell_price = price_data['sell_min']
-                    
+
+                    # 获取产量
+                    materials = get_output_quantity(product_id)
+                    if materials:
+                        output_quantity = materials[0].get('output_quantity', 1)
+                    else:
+                        output_quantity = 1
+
                     # 更新成品数据
-                    output_quantity = float(self.tree.set(item, 'quantity'))
                     self.tree.set(item, 'price', f"{sell_price:,.2f} ISK")
                     total_cost = self._parse_isk_value(self.tree.set(item, 'cost'))
+
+                    # 考虑产量因素，总成本除以产量
+                    total_cost = total_cost / output_quantity
+
                     profit = (sell_price * output_quantity) - total_cost
-                    
+
                     # 更新显示
+                    self.tree.set(item, 'cost', f"{total_cost:,.2f} ISK")
                     self.tree.set(item, 'profit', f"{profit:,.2f} ISK")
-                    self.tree.item(item, tags=('product', 'positive' if profit >=0 else 'negative'))
+                    self.tree.item(item, tags=('product', 'positive' if profit >= 0 else 'negative'))
                 except Exception as e:
                     self.tree.set(item, 'price', "获取失败")
                     self.esi._show_error("成品数据错误", f"{product_name}: {str(e)}")
-            else:        
-                """递归更新利润数据"""
-                children = self.tree.get_children(item)
-                if children:
-                    total_cost = 0
-                    for child in children:
-                        self._update_profit(child)
-                        cost = self._parse_isk_value(self.tree.set(child, 'cost'))
-                        total_cost += cost
-                    
-                    # 更新父节点成本
-                    self.tree.set(item, 'cost', f"{total_cost:,.2f} ISK")
-                    
-                    # 计算利润（需要产品价格数据）
-                    item_name = self.tree.item(item, 'text')
-                    if '制造' in item_name:
-                        product_name = item_name.split('制造 ')[-1]
-                        product_id = find_blueprint_id(product_name)
-                        if product_id:
-                            try:
-                                price_data = self.esi.get_market_price(product_id)
-                                revenue = price_data['sell_min']
-                                cost = total_cost
-                                profit = revenue - cost
-                                
-                                # 使用标签代替状态映射
-                                profit_tag = 'positive' if profit >=0 else 'negative'
-                                self.tree.set(item, 'profit', f"{profit:,.2f} ISK")
-                                self.tree.item(item, tags=(profit_tag,))
-                            except Exception as e:
-                                self.esi._show_error("市场数据错误", str(e))
+        else:
+            children = self.tree.get_children(item)
+            if children:
+                total_cost = 0
+                for child in children:
+                    self._update_profit(child)
+                    cost = self._parse_isk_value(self.tree.set(child, 'cost'))
+                    total_cost += cost
+
+                # 更新父节点成本
+                self.tree.set(item, 'cost', f"{total_cost:,.2f} ISK")
+
+                # 计算利润（需要产品价格数据）
+                item_name = self.tree.item(item, 'text')
+                if '制造' in item_name:
+                    product_name = item_name.split('制造 ')[-1]
+                    product_id = find_blueprint_id(product_name)
+                    if product_id:
+                        try:
+                            price_data = self.esi.get_market_price(product_id)
+                            revenue = price_data['sell_min']
+                            cost = total_cost
+
+                            # 考虑产量因素
+                            materials = get_output_quantity(product_id)
+                            if materials:
+                                output_quantity = materials[0].get('output_quantity', 1)
+                                cost = cost / output_quantity
+
+                            profit = revenue - cost
+
+                            # 使用标签代替状态映射
+                            profit_tag = 'positive' if profit >= 0 else 'negative'
+                            self.tree.set(item, 'profit', f"{profit:,.2f} ISK")
+                            self.tree.item(item, tags=(profit_tag,))
+                        except Exception as e:
+                            self.esi._show_error("市场数据错误", str(e))
 
     def _parse_isk_value(self, value_str):
         """解析金额字符串"""
@@ -511,43 +543,48 @@ class Application(tk.Tk):
         return 0
 
     def _calculate_product_profit(self, product_node, product_name):
-        """独立计算成品利润"""
         def sum_nested_costs(node):
             return sum(
                 self._parse_isk_value(self.tree.set(child, 'cost'))
                 for child in self.tree.get_children(node)
             )
-        
+
         product_id = find_product_id(product_name)
         if product_id:
             try:
                 # 获取成品市场价格
                 price_data = self.esi.get_market_price(product_id)
                 sell_price = price_data['sell_min']
-                
+
                 # 定位材料清单节点（成品节点的下一个同级节点）
                 material_root = self.tree.next(product_node)
-                
+
                 # 递归计算总成本（从材料清单节点开始）
                 total_cost = sum_nested_costs(material_root)
-                
-                # 更新显示数据（考虑产出数量）
+
+                # 考虑产量因素，总成本除以产量
+                materials = get_output_quantity(product_id)
+                if materials:
+                    output_quantity = materials[0].get('output_quantity', 1)
+                    total_cost = total_cost / output_quantity
+
+                # 更新显示数据
                 self.tree.set(product_node, 'cost', f"{total_cost:,.2f} ISK")
                 profit = sell_price - total_cost
                 self.tree.set(product_node, 'profit', f"{profit:,.2f} ISK")
-                
+
                 # 设置数值显示格式
                 self.tree.set(product_node, 'price', f"{sell_price:,.2f} ISK")
                 self.tree.set(product_node, 'cost', f"{total_cost:,.2f} ISK")
                 self.tree.set(product_node, 'profit', f"{profit:,.2f} ISK")
-                
+
                 # 设置颜色标签
                 self.tree.item(product_node,
-                            tags=('product', 'positive' if profit >=0 else 'negative'))
-                
+                            tags=('product', 'positive' if profit >= 0 else 'negative'))
+
             except Exception as e:
-                self.esi._show_error("计算错误", 
-                    f"成品：{product_name}\n错误详情：{str(e)}")
+                self.esi._show_error("计算错误",
+                                    f"成品：{product_name}\n错误详情：{str(e)}")
 
 
 
