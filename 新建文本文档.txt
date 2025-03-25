@@ -420,6 +420,7 @@ class Application(tk.Tk):
         pass
     def _add_materials(self, parent_node, materials, processed, multiplier=1):
         """递归添加材料"""
+        
         if materials:
             # 假设可以通过第一个材料的id来获取product_id，你可以根据实际情况调整
             product_id = materials[0].get('id')
@@ -430,17 +431,17 @@ class Application(tk.Tk):
                 output_quantity = 1
         else:
             output_quantity = 1
-
+        
         for mat in materials:
             # 获取材料基础信息
             mat_name = mat['name_zh']
             base_quantity = mat['quantity']
 
             # 计算实际数量（考虑父级乘数和产出数量）
-            actual_quantity = base_quantity * multiplier / output_quantity
+            actual_quantity = base_quantity * multiplier
 
             # 计算材料成本
-            mat_cost = self._calculate_material_cost(mat, 1, processed) * actual_quantity
+            mat_cost = self._calculate_material_cost(mat, 1, processed, output_quantity) * actual_quantity
 
             # 获取市场数据
             try:
@@ -533,7 +534,7 @@ class Application(tk.Tk):
             return float(value_str.replace(' ISK', '').replace(',', ''))
         return 0
 
-    def _calculate_material_cost(self, mat, quantity, processed):
+    def _calculate_material_cost(self, mat, quantity, processed, output_quantity):
         mat_bp_id = find_blueprint_id(mat['name_zh'])
         if mat_bp_id and mat['name_zh'] not in processed:
             sub_mats = get_materials(mat_bp_id)
@@ -541,23 +542,19 @@ class Application(tk.Tk):
                 sub_total_cost = 0
                 new_processed = processed.copy()
                 new_processed.add(mat['name_zh'])
+                last_mat = sub_mats[-1]
+                sub_quantity = last_mat.get('output_quantity', 1)
                 for sub_mat in sub_mats:
-                    sub_quantity = sub_mat['quantity']
-                    sub_cost = self._calculate_material_cost(sub_mat, 1, new_processed) * sub_quantity
+                    sub_mat_quantity = sub_mat.get('quantity', 1)
+                    sub_cost = self._calculate_material_cost(sub_mat,sub_mat_quantity, new_processed, output_quantity)*sub_mat_quantity
                     sub_total_cost += sub_cost
 
-                output_quantity = mat.get('output_quantity', 1)
-                try:
-                    # 尝试将 output_quantity 转换为浮点数
-                    output_quantity = int(output_quantity)
-                except ValueError:
-                    # 如果转换失败，使用默认值 1
-                    output_quantity = 1
-                return sub_total_cost / output_quantity
+ 
+                return sub_total_cost / sub_quantity 
         try:
             price_data = self.esi.get_market_price(mat['id'])
             price = price_data['sell_min']
-            return price * quantity
+            return price 
         except Exception:
             return 0
     def _sum_nested_costs(self, node):
