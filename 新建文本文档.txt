@@ -420,35 +420,47 @@ class Application(tk.Tk):
         pass
     def _add_materials(self, parent_node, materials, processed, multiplier=1):
         """递归添加材料"""
+        if materials:
+            # 假设可以通过第一个材料的id来获取product_id，你可以根据实际情况调整
+            product_id = materials[0].get('id')
+            output_materials = get_output_quantity(product_id)
+            if output_materials:
+                output_quantity = output_materials[0].get('output_quantity', 1)
+            else:
+                output_quantity = 1
+        else:
+            output_quantity = 1
+
         for mat in materials:
-        # 获取材料基础信息
+            # 获取材料基础信息
             mat_name = mat['name_zh']
             base_quantity = mat['quantity']
-            
-            # 计算实际数量（考虑父级乘数）
-            actual_quantity = base_quantity * multiplier
-            
+
+            # 计算实际数量（考虑父级乘数和产出数量）
+            actual_quantity = base_quantity * multiplier / output_quantity
+
+            # 计算材料成本
+            mat_cost = self._calculate_material_cost(mat, 1, processed) * actual_quantity
+
             # 获取市场数据
             try:
                 price_data = self.esi.get_market_price(mat['id'])
                 price = price_data['sell_min']
-                cost = price * actual_quantity
             except Exception as e:
                 price = 0
-                cost = 0
-            
+
             # 创建节点
             node = self.tree.insert(
-                parent_node, 'end', 
+                parent_node, 'end',
                 text=mat_name,
                 values=(
                     f"{actual_quantity:,.1f}",
                     f"{price:,.2f} ISK" if price else "N/A",
-                    f"{cost:,.2f} ISK" if cost else "N/A",
+                    f"{mat_cost:,.2f} ISK" if mat_cost else "N/A",
                     ""
                 )
             )
-            
+
             # 处理子材料
             mat_bp_id = find_blueprint_id(mat_name)
             if mat_bp_id and mat_name not in processed:
@@ -456,8 +468,8 @@ class Application(tk.Tk):
                 new_processed.add(mat_name)
                 sub_mats = get_materials(mat_bp_id)
                 if sub_mats:
-                    self._add_materials(node, sub_mats, new_processed, actual_quantity)
-
+                    # 子节点以下不考虑父级乘数，使用单次反应数量
+                    self._add_materials(node, sub_mats, new_processed, 1)
     def _calculate_profit(self):
         """计算利润并更新显示"""
         for item in self.tree.get_children():
@@ -465,33 +477,21 @@ class Application(tk.Tk):
             
     def _update_profit(self, item):
         if 'product' in self.tree.item(item, 'tags'):
-            # 处理成品节点
             product_name = self.tree.item(item, 'text').split('制造 ')[-1]
             product_id = find_blueprint_id(product_name)
-
             if product_id:
                 try:
-                    # 获取成品市场价
                     price_data = self.esi.get_market_price(product_id)
                     sell_price = price_data['sell_min']
-
-                    # 获取产量
                     materials = get_output_quantity(product_id)
                     if materials:
                         output_quantity = materials[0].get('output_quantity', 1)
                     else:
                         output_quantity = 1
-
-                    # 更新成品数据
                     self.tree.set(item, 'price', f"{sell_price:,.2f} ISK")
-                    total_cost = self._parse_isk_value(self.tree.set(item, 'cost'))
-
-                    # 考虑产量因素，总成本除以产量
+                    total_cost = self._sum_nested_costs(self.tree.next(item))
                     total_cost = total_cost / output_quantity
-
                     profit = (sell_price * output_quantity) - total_cost
-
-                    # 更新显示
                     self.tree.set(item, 'cost', f"{total_cost:,.2f} ISK")
                     self.tree.set(item, 'profit', f"{profit:,.2f} ISK")
                     self.tree.item(item, tags=('product', 'positive' if profit >= 0 else 'negative'))
@@ -506,11 +506,7 @@ class Application(tk.Tk):
                     self._update_profit(child)
                     cost = self._parse_isk_value(self.tree.set(child, 'cost'))
                     total_cost += cost
-
-                # 更新父节点成本
                 self.tree.set(item, 'cost', f"{total_cost:,.2f} ISK")
-
-                # 计算利润（需要产品价格数据）
                 item_name = self.tree.item(item, 'text')
                 if '制造' in item_name:
                     product_name = item_name.split('制造 ')[-1]
@@ -520,16 +516,11 @@ class Application(tk.Tk):
                             price_data = self.esi.get_market_price(product_id)
                             revenue = price_data['sell_min']
                             cost = total_cost
-
-                            # 考虑产量因素
                             materials = get_output_quantity(product_id)
                             if materials:
                                 output_quantity = materials[0].get('output_quantity', 1)
                                 cost = cost / output_quantity
-
                             profit = revenue - cost
-
-                            # 使用标签代替状态映射
                             profit_tag = 'positive' if profit >= 0 else 'negative'
                             self.tree.set(item, 'profit', f"{profit:,.2f} ISK")
                             self.tree.item(item, tags=(profit_tag,))
@@ -541,6 +532,48 @@ class Application(tk.Tk):
         if 'ISK' in value_str:
             return float(value_str.replace(' ISK', '').replace(',', ''))
         return 0
+
+    def _calculate_material_cost(self, mat, quantity, processed):
+        mat_bp_id = find_blueprint_id(mat['name_zh'])
+        if mat_bp_id and mat['name_zh'] not in processed:
+            sub_mats = get_materials(mat_bp_id)
+            if sub_mats:
+                sub_total_cost = 0
+                new_processed = processed.copy()
+                new_processed.add(mat['name_zh'])
+                for sub_mat in sub_mats:
+                    sub_quantity = sub_mat['quantity']
+                    sub_cost = self._calculate_material_cost(sub_mat, 1, new_processed) * sub_quantity
+                    sub_total_cost += sub_cost
+
+                output_quantity = mat.get('output_quantity', 1)
+                try:
+                    # 尝试将 output_quantity 转换为浮点数
+                    output_quantity = int(output_quantity)
+                except ValueError:
+                    # 如果转换失败，使用默认值 1
+                    output_quantity = 1
+                return sub_total_cost / output_quantity
+        try:
+            price_data = self.esi.get_market_price(mat['id'])
+            price = price_data['sell_min']
+            return price * quantity
+        except Exception:
+            return 0
+    def _sum_nested_costs(self, node):
+        total_cost = 0
+        for child in self.tree.get_children(node):
+            cost_str = self.tree.set(child, 'cost')
+            cost = self._parse_isk_value(cost_str)
+            total_cost += cost
+            total_cost += self._sum_nested_costs(child)
+        return total_cost
+
+    def _parse_isk_value(self, value_str):
+        try:
+            return float(value_str.replace(' ISK', '').replace(',', ''))
+        except ValueError:
+            return 0
 
     def _calculate_product_profit(self, product_node, product_name):
         def sum_nested_costs(node):
@@ -585,10 +618,7 @@ class Application(tk.Tk):
             except Exception as e:
                 self.esi._show_error("计算错误",
                                     f"成品：{product_name}\n错误详情：{str(e)}")
-
-
-
-
+            
 if __name__ == "__main__":
     app = Application()
     app.mainloop()
